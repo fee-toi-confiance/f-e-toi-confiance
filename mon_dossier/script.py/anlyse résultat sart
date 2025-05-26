@@ -1,581 +1,639 @@
-import os
-import sys
-import argparse
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from datetime import datetime
-import csv
-import io
-from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib import colors
-from reportlab.lib.units import inch
-import matplotlib
-matplotlib.use('Agg')  # Use non-interactive backend
+import json
+from scipy.stats import norm # Pour les calculs d' et beta
 
-# Importer l'analyseur SART depuis le module principal
-# Si ce code est dans un fichier séparé, assurez-vous que le module SARTAnalyzer est dans le chemin Python
-try:
-    from sart_analysis import SARTAnalyzer
-except ImportError:
-    print("Erreur: Impossible d'importer la classe SARTAnalyzer.")
-    print("Assurez-vous que le fichier sart_analysis.py est dans le même répertoire.")
-    sys.exit(1)
-
-def detect_csv_format(file_path):
+class SARTAnalyzer:
     """
-    Détecte automatiquement le format du fichier CSV (séparateur, encodage, etc.)
-
-    Paramètres:
-    -----------
-    file_path : str
-        Chemin vers le fichier CSV
-
-    Retourne:
-    ---------
-    dict
-        Dictionnaire avec les paramètres détectés (separator, encoding, decimal)
+    Classe pour l'analyse des données de la tâche SART (Sustained Attention to Response Task).
     """
-    # Essayer différents encodages
-    encodings = ['utf-8', 'latin-1', 'iso-8859-1', 'cp1252']
-    for encoding in encodings:
-        try:
-            # Lire les premières lignes pour détecter le séparateur
-            with open(file_path, 'r', encoding=encoding) as f:
-                sample = ''.join([f.readline() for _ in range(5)])
 
-            # Compter les occurrences de séparateurs potentiels
-            separators = [',', ';', '\t', '|']
-            sep_counts = {sep: sample.count(sep) for sep in separators}
-
-            # Choisir le séparateur le plus fréquent
-            detected_sep = max(sep_counts, key=sep_counts.get)
-
-            # Détection du séparateur décimal
-            decimal = ',' if detected_sep == ';' else '.'
-
-            print(f"Format CSV détecté: séparateur='{detected_sep}', encodage='{encoding}', décimal='{decimal}'")
-            return {
-                'separator': detected_sep,
-                'encoding': encoding,
-                'decimal': decimal
-            }
-        except Exception:
-            continue
-
-    # Par défaut, si aucune détection n'a fonctionné
-    print("Impossible de détecter automatiquement le format. Utilisation des paramètres par défaut.")
-    return {
-        'separator': ',',
-        'encoding': 'utf-8',
-        'decimal': '.'
-    }
-
-def guess_column_mapping(df):
-    """
-    Essaie de deviner les correspondances entre les colonnes du fichier et les noms standards
-
-    Paramètres:
-    -----------
-    df : pandas.DataFrame
-        DataFrame contenant les données
-
-    Retourne:
-    ---------
-    dict
-        Dictionnaire de correspondance des colonnes {nom_original: nom_standard}
-    """
-    mapping = {}
-
-    # Mots-clés pour chaque type de colonne
-    keywords = {
-        'stimulus': ['stimulus', 'chiffre', 'digit', 'stim', 'nombre', 'number', 'cible', 'target'],
-        'response': ['response', 'reponse', 'réponse', 'resp', 'key', 'touche', 'bouton', 'button'],
-        'reaction_time': ['reaction_time', 'rt', 'temps', 'time', 'reaction', 'latence', 'latency', 'ms']
-    }
-
-    # Rechercher des correspondances approximatives dans les noms de colonnes
-    for col in df.columns:
-        col_lower = str(col).lower().strip()
-        for standard_name, kw_list in keywords.items():
-            for keyword in kw_list:
-                if keyword in col_lower:
-                    mapping[col] = standard_name
-                    print(f"Correspondance détectée: '{col}' -> '{standard_name}'")
-                    break
-
-    # Vérifier si nous avons manqué des colonnes essentielles
-    missing_cols = set(['stimulus', 'response', 'reaction_time']) - set(mapping.values())
-    if missing_cols:
-        print(f"Avertissement: Colonnes essentielles non détectées: {', '.join(missing_cols)}")
-
-    # Essayer de faire des suppositions basées sur le type et contenu des colonnes
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-
-    # Si nous n'avons pas identifié la colonne stimulus
-    if 'stimulus' not in mapping.values() and numeric_cols:
-        # Chercher une colonne avec peu de valeurs uniques qui pourrait être un stimulus
-        for col in numeric_cols:
-            if df[col].nunique() < 10 and col not in mapping.keys():  # Typiquement peu de stimuli différents
-                mapping[col] = 'stimulus'
-                print(f"Supposition: '{col}' pourrait être 'stimulus' (peu de valeurs uniques)")
-                break
-
-    # Si nous n'avons pas identifié la colonne reaction_time
-    if 'reaction_time' not in mapping.values() and numeric_cols:
-        # Chercher une colonne à valeurs numériques élevées qui pourrait être RT
-        for col in numeric_cols:
-            if df[col].median() > 100 and col not in mapping.keys():  # Les RT sont généralement > 100ms
-                mapping[col] = 'reaction_time'
-                print(f"Supposition: '{col}' pourrait être 'reaction_time' (valeurs typiques de RT)")
-                break
-
-    # Si nous n'avons pas identifié la colonne response
-    if 'response' not in mapping.values():
-        # Chercher une colonne qui pourrait contenir des réponses
-        for col in df.columns:
-            if col not in mapping.keys():
-                unique_vals = df[col].nunique()
-                if 1 <= unique_vals <= 5:  # Généralement peu de touches de réponse
-                    mapping[col] = 'response'
-                    print(f"Supposition: '{col}' pourrait être 'response' (peu de réponses uniques)")
-                    break
-
-    return mapping
-
-def generate_pdf_report(analyzer, output_file, figures=None):
-    """
-    Génère un rapport PDF détaillé des résultats de l'analyse SART
-
-    Paramètres:
-    -----------
-    analyzer : SARTAnalyzer
-        Instance de l'analyseur SART contenant les résultats
-    output_file : str
-        Chemin vers le fichier PDF de sortie
-    figures : list, optional
-        Liste des figures matplotlib à inclure dans le rapport
-    """
-    print(f"Génération du rapport PDF: {output_file}")
-    
-    # Créer le document PDF
-    doc = SimpleDocTemplate(output_file, pagesize=letter)
-    styles = getSampleStyleSheet()
-    
-    # Créer des styles personnalisés
-    styles.add(ParagraphStyle(name='Title', 
-                              parent=styles['Heading1'], 
-                              fontSize=18, 
-                              alignment=1,
-                              spaceAfter=12))
-    
-    styles.add(ParagraphStyle(name='Subtitle', 
-                              parent=styles['Heading2'], 
-                              fontSize=14, 
-                              spaceAfter=10))
-    
-    styles.add(ParagraphStyle(name='Section', 
-                              parent=styles['Heading3'], 
-                              fontSize=12, 
-                              spaceAfter=8))
-    
-    # Contenu du rapport
-    content = []
-    
-    # Titre du rapport
-    content.append(Paragraph("Rapport d'analyse SART", styles['Title']))
-    content.append(Paragraph(f"Généré le {datetime.now().strftime('%d/%m/%Y à %H:%M')}", styles['Normal']))
-    content.append(Spacer(1, 0.2*inch))
-    
-    # 1. Résumé des résultats
-    content.append(Paragraph("1. Résumé des résultats", styles['Subtitle']))
-    
-    # Tableau des métriques principales
-    results = analyzer.results
-    data = [
-        ["Métrique", "Valeur"],
-        ["Précision globale", f"{results.get('accuracy', 'N/A'):.2%}"],
-        ["Erreurs de commission", f"{results.get('commission_error_rate', 'N/A'):.2%}"],
-        ["Erreurs d'omission", f"{results.get('omission_error_rate', 'N/A'):.2%}"],
-        ["Temps de réaction moyen", f"{results.get('mean_rt', 'N/A'):.2f} ms"],
-        ["d' (sensibilité)", f"{results.get('d_prime', 'N/A'):.2f}"],
-        ["Biais de réponse (β)", f"{results.get('beta', 'N/A'):.2f}"],
-        ["Variabilité des TR", f"{results.get('rt_variability', 'N/A'):.2f} ms"]
-    ]
-    
-    t = Table(data, colWidths=[2.5*inch, 2.5*inch])
-    t.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (1, 0), colors.grey),
-        ('TEXTCOLOR', (0, 0), (1, 0), colors.whitesmoke),
-        ('ALIGN', (0, 0), (1, 0), 'CENTER'),
-        ('FONTNAME', (0, 0), (1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (1, 0), 12),
-        ('BOTTOMPADDING', (0, 0), (1, 0), 12),
-        ('BACKGROUND', (0, 1), (1, -1), colors.beige),
-        ('GRID', (0, 0), (-1, -1), 1, colors.black),
-        ('ALIGN', (1, 1), (1, -1), 'RIGHT'),
-    ]))
-    
-    content.append(t)
-    content.append(Spacer(1, 0.2*inch))
-    
-    # 2. Interprétation
-    content.append(Paragraph("2. Interprétation des résultats", styles['Subtitle']))
-    
-    # Interprétation de la précision
-    accuracy = results.get('accuracy', 0)
-    if accuracy > 0.9:
-        acc_interpretation = "Excellente précision globale, suggérant un bon niveau d'attention soutenue."
-    elif accuracy > 0.8:
-        acc_interpretation = "Bonne précision globale, niveau d'attention soutenue satisfaisant."
-    elif accuracy > 0.7:
-        acc_interpretation = "Précision moyenne, des difficultés d'attention soutenue possibles."
-    else:
-        acc_interpretation = "Précision faible, suggérant des difficultés importantes d'attention soutenue."
-    
-    content.append(Paragraph("<b>Précision globale:</b> " + acc_interpretation, styles['Normal']))
-    content.append(Spacer(1, 0.1*inch))
-    
-    # Interprétation des erreurs de commission
-    commission = results.get('commission_error_rate', 0)
-    if commission < 0.05:
-        com_interpretation = "Très peu d'erreurs de commission, suggérant un bon contrôle de l'inhibition."
-    elif commission < 0.15:
-        com_interpretation = "Taux d'erreurs de commission modéré, contrôle de l'inhibition satisfaisant."
-    elif commission < 0.25:
-        com_interpretation = "Taux d'erreurs de commission élevé, des difficultés de contrôle de l'inhibition possibles."
-    else:
-        com_interpretation = "Taux d'erreurs de commission très élevé, suggérant des difficultés importantes de contrôle de l'inhibition."
-    
-    content.append(Paragraph("<b>Erreurs de commission:</b> " + com_interpretation, styles['Normal']))
-    content.append(Spacer(1, 0.1*inch))
-    
-    # Interprétation d'omission
-    omission = results.get('omission_error_rate', 0)
-    if omission < 0.05:
-        om_interpretation = "Très peu d'erreurs d'omission, suggérant une bonne vigilance."
-    elif omission < 0.15:
-        om_interpretation = "Taux d'erreurs d'omission modéré, niveau de vigilance satisfaisant."
-    elif omission < 0.25:
-        om_interpretation = "Taux d'erreurs d'omission élevé, des difficultés de vigilance possibles."
-    else:
-        om_interpretation = "Taux d'erreurs d'omission très élevé, suggérant des difficultés importantes de vigilance."
-    
-    content.append(Paragraph("<b>Erreurs d'omission:</b> " + om_interpretation, styles['Normal']))
-    content.append(Spacer(1, 0.1*inch))
-    
-    # Interprétation du d'
-    dprime = results.get('d_prime', 0)
-    if dprime > 3:
-        d_interpretation = "Excellente sensibilité (d' élevé), suggérant une bonne discrimination entre les stimuli."
-    elif dprime > 2:
-        d_interpretation = "Bonne sensibilité (d'), discrimination satisfaisante entre les stimuli."
-    elif dprime > 1:
-        d_interpretation = "Sensibilité moyenne (d'), certaines difficultés de discrimination possibles."
-    else:
-        d_interpretation = "Faible sensibilité (d' bas), suggérant des difficultés importantes de discrimination."
-    
-    content.append(Paragraph("<b>Sensibilité (d'):</b> " + d_interpretation, styles['Normal']))
-    content.append(Spacer(1, 0.1*inch))
-    
-    # Interprétation de la variabilité des TR
-    rtcv = results.get('rt_cv', 0) * 100  # Coefficient de variation en pourcentage
-    if rtcv < 15:
-        rtcv_interpretation = "Faible variabilité des temps de réaction, suggérant une performance stable."
-    elif rtcv < 25:
-        rtcv_interpretation = "Variabilité modérée des temps de réaction, stabilité de la performance acceptable."
-    elif rtcv < 35:
-        rtcv_interpretation = "Variabilité élevée des temps de réaction, indiquant une instabilité possible de l'attention."
-    else:
-        rtcv_interpretation = "Très forte variabilité des temps de réaction, suggérant une instabilité importante de l'attention."
-    
-    content.append(Paragraph("<b>Variabilité des temps de réaction:</b> " + rtcv_interpretation, styles['Normal']))
-    content.append(Spacer(1, 0.2*inch))
-    
-    # 3. Intégration des figures
-    if figures:
-        content.append(Paragraph("3. Visualisations des données", styles['Subtitle']))
+    def __init__(self):
+        """
+        Initialise SARTAnalyzer.
+        """
+        self.raw_data = pd.DataFrame() # Données brutes fournies par prog.py (déjà un peu préparées)
+        self.processed_data = pd.DataFrame() # Données après le prétraitement SART spécifique
+        self.results = {} # Dictionnaire pour stocker toutes les métriques calculées
         
-        for i, fig in enumerate(figures):
-            # Sauvegarder la figure dans un buffer temporaire
-            buf = io.BytesIO()
-            fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
-            buf.seek(0)
-            
-            # Ajouter une image au document
-            img = Image(buf, width=6*inch, height=4*inch)
-            content.append(img)
-            
-            # Ajouter une légende
-            if i == 0:
-                caption = "Figure 1: Métriques de base de la performance SART"
-            elif i == 1:
-                caption = "Figure 2: Métriques avancées de l'attention soutenue"
-            elif i == 2:
-                caption = "Figure 3: Effets séquentiels sur la performance"
-            elif i == 3:
-                caption = "Figure 4: Distribution des temps de réaction"
-            else:
-                caption = f"Figure {i+1}"
-            
-            content.append(Paragraph(caption, styles['Caption']))
-            content.append(Spacer(1, 0.2*inch))
-    
-    # 4. Conclusions et recommandations
-    content.append(Paragraph("4. Conclusions et recommandations", styles['Subtitle']))
-    
-    # Évaluation globale
-    if accuracy > 0.85 and commission < 0.15 and dprime > 2:
-        overall = "L'analyse des résultats SART suggère un excellent niveau d'attention soutenue et un bon contrôle de l'inhibition. "
-        recomm = "Aucune intervention spécifique n'est recommandée sur la base de ces résultats."
-    elif accuracy > 0.75 and commission < 0.25 and dprime > 1.5:
-        overall = "L'analyse des résultats SART suggère un niveau satisfaisant d'attention soutenue avec quelques faiblesses mineures dans le contrôle de l'inhibition. "
-        recomm = "Des exercices modérés d'attention pourraient être bénéfiques pour améliorer davantage les performances."
-    elif accuracy > 0.65 and commission < 0.35 and dprime > 1:
-        overall = "L'analyse des résultats SART suggère certaines difficultés d'attention soutenue et de contrôle de l'inhibition. "
-        recomm = "Des exercices réguliers d'attention et de contrôle cognitif pourraient être bénéfiques. Une évaluation plus approfondie pourrait être envisagée si ces difficultés impactent la vie quotidienne."
-    else:
-        overall = "L'analyse des résultats SART suggère des difficultés importantes d'attention soutenue et de contrôle de l'inhibition. "
-        recomm = "Une évaluation plus approfondie par un spécialiste est recommandée pour explorer ces difficultés et proposer des interventions adaptées."
-    
-    content.append(Paragraph(overall, styles['Normal']))
-    content.append(Spacer(1, 0.1*inch))
-    content.append(Paragraph("<b>Recommandations:</b> " + recomm, styles['Normal']))
-    
-    # Ajouter le contenu au document et générer le PDF
-    doc.build(content)
-    
-    return output_file
+        self.target_stimulus_value = None # Valeur du stimulus cible (No-Go)
+        self.column_mapping_used = {} # Mapping de colonnes réellement utilisé
 
-def analyze_sart_csv(input_file, output_dir=None, target_value=None, column_mapping=None, generate_pdf=True):
-    """
-    Analyser un fichier CSV contenant des données SART et générer un rapport complet
+        # Noms des colonnes standard attendues par l'analyseur après mapping
+        self.col_stimulus = 'stimulus'
+        self.col_response = 'response' # Doit indiquer un appui (ex: 1) ou non (ex: 0)
+        self.col_rt = 'reaction_time'  # Doit être en millisecondes
 
-    Paramètres:
-    -----------
-    input_file : str
-        Chemin vers le fichier CSV d'entrée
-    output_dir : str, optional
-        Répertoire de sortie pour les résultats. Par défaut, utilise le même répertoire que le fichier d'entrée
-    target_value : any, optional
-        Valeur qui identifie un stimulus comme étant une cible
-    column_mapping : dict, optional
-        Dictionnaire de correspondance personnalisé pour les noms de colonnes
-    generate_pdf : bool, optional
-        Si True, génère un rapport PDF en plus des autres formats
+        # Noms des colonnes qui seront créées durant le prétraitement interne
+        self.col_is_target = 'is_target_trial' # Booléen: True si c'est un essai cible (No-Go)
+        self.col_is_commission = 'is_commission_error' # Booléen
+        self.col_is_omission = 'is_omission_error'   # Booléen
+        self.col_is_correct_go = 'is_correct_go_response' # Booléen
+        self.col_is_correct_no_go = 'is_correct_no_go_response' # Booléen
+        self.col_is_correct = 'is_correct_trial' # Booléen
+        self.col_valid_rt = 'is_valid_rt' # Booléen pour TR dans les seuils
 
-    Retourne:
-    ---------
-    tuple
-        (analyzer, results_file, report_file, figures) - L'analyseur, les chemins vers les fichiers de résultats et de rapport,
-        et la liste des figures générées
-    """
-    print(f"\n{'='*60}")
-    print(f"ANALYSE SART: {os.path.basename(input_file)}")
-    print(f"{'='*60}\n")
-
-    # Vérifier que le fichier existe
-    if not os.path.exists(input_file):
-        raise FileNotFoundError(f"Le fichier {input_file} n'existe pas.")
-
-    # Vérifier que le fichier est bien un CSV
-    file_ext = os.path.splitext(input_file)[1].lower()
-    if file_ext != '.csv':
-        print(f"Avertissement: Le fichier n'a pas l'extension .csv ({file_ext})")
-
-    # Vérifier si le contenu ressemble à un CSV
-    try:
-        with open(input_file, 'r', encoding='utf-8') as f:
-            first_line = f.readline().strip()
-            if ',' not in first_line and ';' not in first_line and '\t' not in first_line:
-                print("Le contenu ne semble pas être au format CSV.")
-                cont = input("Voulez-vous continuer quand même? (o/n): ")
-                if cont.lower() != 'o':
-                    sys.exit(0)
-    except Exception as e:
-        print(f"Erreur lors de la vérification du contenu du fichier: {e}")
-
-    # Déterminer le répertoire de sortie
-    if output_dir is None:
-        output_dir = os.path.dirname(input_file)
-        if not output_dir:
-            output_dir = "."
-
-    # Créer le répertoire de sortie s'il n'existe pas
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-    print(f"Répertoire de sortie créé: {output_dir}")
-
-    # Nom de base pour les fichiers de sortie
-    base_name = os.path.splitext(os.path.basename(input_file))[0]
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    # Détecter le format du CSV
-    print("\n1. Détection du format CSV...")
-    csv_params = detect_csv_format(input_file)
-
-    # Initialiser l'analyseur et charger le fichier
-    print("\n2. Chargement des données...")
-    analyzer = SARTAnalyzer()
-
-    # Tenter de charger le fichier avec les paramètres détectés
-    try:
-        df = pd.read_csv(
-            input_file,
-            sep=csv_params['separator'],
-            encoding=csv_params['encoding'],
-            decimal=csv_params['decimal']
-        )
-        analyzer.data = df
-        print(f"Fichier chargé avec succès: {len(df)} lignes, {len(df.columns)} colonnes")
-
-        # Afficher un aperçu des données
-        print("\nAperçu des données:")
-        print(df.head(3).to_string())
-
-        # Afficher les informations sur les colonnes
-        print("\nInformations sur les colonnes:")
-        for col in df.columns:
-            unique_vals = df[col].nunique()
-            data_type = df[col].dtype
-            print(f" - {col}: {unique_vals} valeurs uniques, type: {data_type}")
-
-        # Si aucun mapping de colonnes n'est fourni, essayer de le deviner
-        if column_mapping is None:
-            print("\n3. Détection automatique des colonnes...")
-            column_mapping = guess_column_mapping(df)
-
-        # Afficher le mapping trouvé
-        print("\nCorrespondance des colonnes détectée:")
-        for orig, std in column_mapping.items():
-            print(f" - {orig} -> {std}")
-
-        # Vérifier si toutes les colonnes nécessaires ont été identifiées
-        required_cols = {'stimulus', 'response', 'reaction_time'}
-        found_cols = set(column_mapping.values())
-        missing = required_cols - found_cols
-        if missing:
-            print(f"\nATTENTION: Colonnes requises non identifiées: {', '.join(missing)}")
-            print("Vous devez spécifier manuellement le mapping des colonnes avec l'option --column-mapping")
-            print("Exemple: --column-mapping 'colonne1:stimulus' 'colonne2:response' 'colonne3:reaction_time'")
-            cont = input("Voulez-vous continuer avec le mapping partiel détecté? (o/n): ")
-            if cont.lower() != 'o':
-                sys.exit(0)
-
-    except Exception as e:
-        print(f"\nERREUR: {e}")
-        print("\nConseil de débogage:")
-        print("1. Vérifiez le format de votre fichier CSV et assurez-vous qu'il contient bien les données SART.")
-        print("2. Les colonnes essentielles sont: stimulus, response, reaction_time.")
-        print("3. Utilisez les options --csv-separator, --csv-encoding et --csv-decimal pour spécifier le format.")
-        print("4. Utilisez l'option --interactive pour un guidage étape par étape.")
-        sys.exit(1)
-
-    # Prétraiter les données
-    print("\n4. Prétraitement des données...")
-    try:
-        analyzer.preprocess_data(target_stimulus=target_value, column_mapping=column_mapping)
-    except Exception as e:
-        print(f"Erreur lors du prétraitement: {e}")
-        
-        # Si le prétraitement échoue, afficher des informations utiles pour le débogage
-        print("\nContenu des colonnes détectées:")
-        for std_name, orig_name in {v: k for k, v in column_mapping.items()}.items():
-            if orig_name in analyzer.data.columns:
-                unique_vals = analyzer.data[orig_name].unique()[:5]
-                print(f" - {std_name} ('{orig_name}'): {unique_vals}")
-
-        # Essayer de déterminer automatiquement la valeur cible si non spécifiée
-        if target_value is None and 'stimulus' in column_mapping.values():
-            stim_col = [k for k, v in column_mapping.items() if v == 'stimulus'][0]
-            unique_stims = analyzer.data[stim_col].unique()
-            print(f"\nValeurs uniques de stimulus: {unique_stims}")
-            
-            if len(unique_stims) > 1 and len(unique_stims) < 10:
-                # Supposer que la valeur la moins fréquente est la cible
-                counts = analyzer.data[stim_col].value_counts()
-                least_common = counts.idxmin()
-                print(f"Suggestion: la valeur '{least_common}' pourrait être la cible (la moins fréquente)")
-                
-                use_suggestion = input(f"Utiliser '{least_common}' comme valeur cible? (o/n): ")
-                if use_suggestion.lower() == 'o':
-                    target_value = least_common
-                    
-                    # Réessayer le prétraitement avec la nouvelle valeur cible
-                    try:
-                        analyzer.preprocess_data(target_stimulus=target_value, column_mapping=column_mapping)
-                        print(f"Succès avec la valeur cible = {target_value}")
-                    except Exception as e2:
-                        print(f"Échec même avec la valeur cible suggérée: {e2}")
-                        sys.exit(1)
-                else:
-                    sys.exit(1)
-            else:
-                sys.exit(1)
+    def _apply_column_mapping(self, df, column_mapping_param):
+        """
+        Applique le mapping de colonnes au DataFrame.
+        Les noms de colonnes originaux sont les clés, les noms standards sont les valeurs.
+        Ex: {'StimVal': 'stimulus', 'RTms': 'reaction_time', 'RespKey': 'response'}
+        """
+        mapped_df = df.copy()
+        if not column_mapping_param:
+            print("  AVERTISSEMENT (_apply_column_mapping): Aucun mapping de colonnes fourni. Utilisation des noms de colonnes originaux comme standards.")
+            # Tenter de deviner si les noms standards sont déjà présents
+            self.column_mapping_used = {col: col for col in [self.col_stimulus, self.col_response, self.col_rt] if col in mapped_df.columns}
         else:
-            sys.exit(1)
-
-    # Calculer les métriques
-    print("\n5. Calcul des métriques...")
-    analyzer.calculate_basic_metrics()
-    analyzer.calculate_advanced_metrics()
-
-    # Analyser les effets temporels et séquentiels
-    print("\n6. Analyse des effets temporels et séquentiels...")
-    try:
-        # Déterminer la taille de fenêtre basée sur le nombre d'essais
-        window_size = max(10, int(len(analyzer.data) * 0.1))  # 10% des essais ou au moins 10
-        
-        analyzer.analyze_time_on_task_effects(window_size=window_size)
-        analyzer.analyze_sequential_effects(n_back=1)
-    except Exception as e:
-        print(f"Avertissement: Impossible d'analyser les effets temporels/séquentiels: {e}")
-
-    # Générer les résultats et rapports
-    print("\n7. Génération des résultats et rapports...")
-    
-    # Fichier JSON des résultats
-    results_file = os.path.join(output_dir, f"{base_name}_results_{timestamp}.json")
-    analyzer.export_results(results_file)
-    print(f"Résultats exportés vers: {results_file}")
-
-    # Rapport détaillé au format Markdown
-    report_file = os.path.join(output_dir, f"{base_name}_report_{timestamp}.md")
-    analyzer.generate_report(report_file)
-    print(f"Rapport généré vers: {report_file}")
-
-    # Générer les visualisations
-    print("\n8. Génération des visualisations...")
-    figures = []
-
-    try:
-        # Métriques de base
-        fig1 = analyzer.plot_basic_metrics()
-        figures.append(fig1)
-        basic_fig_file = os.path.join(output_dir, f"{base_name}_basic_metrics_{timestamp}.png")
-        fig1.savefig(basic_fig_file, dpi=100, bbox_inches='tight')
-        print(f"Graphique des métriques de base enregistré: {basic_fig_file}")
-
-        # Métriques avancées
-        fig2 = analyzer.plot_advanced_metrics()
-        figures.append(fig2)
-        adv_fig_file = os.path.join(output_dir, f"{base_name}_advanced_metrics_{timestamp}.png")
-        fig2.savefig(adv_fig_file, dpi=100, bbox_inches='tight')
-        print(f"Graphique des métriques avancées enregistré: {adv_fig_file}")
-
-        # Effets séquentiels
-        fig3 = analyzer.plot_sequential_effects()
-        figures.append(fig3)
-        seq_fig_file = os.path.join(output_dir, f"{base_name}_sequential_effects_{timestamp}.png")
-        fig3.savefig(seq_fig_file, dpi=100, bbox_inches='tight')
-        print(f"Graphique des effets séquentiels enregistré: {seq_fig_file}")
-
-        # Distribution des temps de réaction
-        try:
-            fig4 = plt.figure(figsize=(10, 6))
-            rt_col = [k for k, v in column_mapping.items() if v == 'reaction_time'][0]
-            valid_rts = analyzer.data[rt_col].dropna()
+            self.column_mapping_used = column_mapping_param
+            rename_dict = {}
+            for original_name, standard_name in self.column_mapping_used.items():
+                if original_name in mapped_df.columns:
+                    rename_dict[original_name] = standard_name
+                else:
+                    # This case should be caught by prog.py already
+                    print(f"  AVERTISSEMENT (_apply_column_mapping): Colonne originale '{original_name}' du mapping non trouvée dans le DataFrame.")
             
-            plt.hist(valid_rts, bins=30, alpha=0.7, color='blue
+            mapped_df.rename(columns=rename_dict, inplace=True)
+
+        # Vérifier que les colonnes standard nécessaires sont présentes après mapping
+        required_std_cols = [self.col_stimulus, self.col_response, self.col_rt]
+        for std_col in required_std_cols:
+            if std_col not in mapped_df.columns:
+                raise ValueError(f"Colonne standard requise '{std_col}' non trouvée dans le DataFrame après application du mapping. "
+                                 f"Colonnes disponibles: {mapped_df.columns.tolist()}. Mapping utilisé: {self.column_mapping_used}")
+        return mapped_df
+
+    def preprocess_data(self, target_stimulus, column_mapping, 
+                        response_value_for_press=1, rt_threshold_ms=(100, 2000)):
+        """
+        Prétraite les données brutes (déjà partiellement préparées par prog.py).
+        - Applique le mapping final des colonnes.
+        - Identifie les essais cibles (No-Go) et non-cibles (Go).
+        - Détermine les erreurs de commission et d'omission basées sur la logique SART.
+        - Valide les temps de réaction.
+
+        Paramètres:
+        -----------
+        target_stimulus : any
+            La valeur dans la colonne 'stimulus' qui représente la cible (No-Go).
+            Le type doit être comparable aux données de la colonne stimulus.
+        column_mapping : dict
+            Dictionnaire pour mapper les noms de colonnes du DataFrame fourni aux noms standards
+            (`stimulus`, `response`, `reaction_time`).
+        response_value_for_press : any, optional
+            La valeur dans la colonne 'response' (après mapping) qui indique un appui sur une touche.
+            Toute autre valeur est considérée comme une non-réponse. Défaut: 1.
+        rt_threshold_ms : tuple (min_rt_ms, max_rt_ms), optional
+            Seuil pour les temps de réaction valides, en millisecondes. Défaut: (100, 2000).
+        """
+        if self.raw_data.empty:
+            raise ValueError("Les données brutes (raw_data) n'ont pas été chargées dans l'analyseur.")
+        if target_stimulus is None: # Vérifié par prog.py mais double-check
+            raise ValueError("La valeur `target_stimulus` (cible No-Go) doit être spécifiée.")
+        
+        self.target_stimulus_value = target_stimulus
+        
+        # 1. Appliquer le mapping de colonnes
+        # column_mapping est déjà le dictionnaire final {original_or_derived_name: standard_name}
+        df = self._apply_column_mapping(self.raw_data.copy(), column_mapping)
+
+        # 2. S'assurer que les colonnes clés sont des types appropriés pour l'analyse
+        #    prog.py a déjà lu toutes les colonnes en 'str', puis a fait des conversions pour RT (en ms)
+        #    et a dérivé 'response' en int (0/1).
+        
+        # Stimulus: comparaison robuste de type
+        stim_data_col = df[self.col_stimulus] # Devrait être de type 'object' contenant des str de prog.py
+        target_val_typed = self.target_stimulus_value # Déjà typé par prog.py (int, float, ou str)
+
+        print(f"  INFO (SARTAnalyzer): Comparaison du stimulus. Type de target_value = {type(target_val_typed)}. Échantillon de la colonne stimulus: {stim_data_col.unique()[:5]}")
+        if isinstance(target_val_typed, (int, float)):
+            # Convertir la colonne stimulus en numérique pour la comparaison
+            stim_data_numeric = pd.to_numeric(stim_data_col, errors='coerce')
+            df[self.col_is_target] = (stim_data_numeric == target_val_typed)
+            if stim_data_numeric.isnull().any() and df[self.col_is_target].sum() < len(df)/100: # Si bcp de NaN après conversion et peu de cibles trouvées
+                 print(f"  AVERTISSEMENT: Beaucoup de valeurs stimulus n'ont pu être converties en numérique pour comparaison avec la cible numérique '{target_val_typed}'. Vérifiez les données stimulus.")
+        elif isinstance(target_val_typed, str):
+            df[self.col_is_target] = (stim_data_col.astype(str) == target_val_typed)
+        else: # Fallback peu probable si prog.py a bien typé
+            print(f"  AVERTISSEMENT: Type inattendu pour target_stimulus_value: {type(target_val_typed)}. Tentative de comparaison directe.")
+            df[self.col_is_target] = (stim_data_col == target_val_typed)
+        
+        # Response: s'assurer qu'elle est numérique (0 ou 1) comme dérivé par prog.py
+        df[self.col_response] = pd.to_numeric(df[self.col_response], errors='coerce').fillna(0).astype(int) # S'assurer que c'est bien 0 ou 1
+
+        # Reaction Time: s'assurer qu'elle est numérique (devrait être float, en ms)
+        df[self.col_rt] = pd.to_numeric(df[self.col_rt], errors='coerce') # Les non-numériques deviennent NaN
+
+        # 3. Interpréter les réponses basées sur response_value_for_press
+        df['user_made_response'] = (df[self.col_response] == response_value_for_press)
+
+        # 4. Identifier les types d'essais et les erreurs selon la logique SART
+        # Erreur de commission (Type I): réponse (appui) à une cible (No-Go trial)
+        df[self.col_is_commission] = df[self.col_is_target] & df['user_made_response']
+
+        # Erreur d'omission (Type II): absence de réponse à un non-cible (Go trial)
+        df[self.col_is_omission] = ~df[self.col_is_target] & ~df['user_made_response']
+        
+        # Réponse correcte Go: réponse à un non-cible
+        df[self.col_is_correct_go] = ~df[self.col_is_target] & df['user_made_response']
+        
+        # Réponse correcte No-Go: absence de réponse à une cible
+        df[self.col_is_correct_no_go] = df[self.col_is_target] & ~df['user_made_response']
+
+        # Essai correct globalement
+        df[self.col_is_correct] = df[self.col_is_correct_go] | df[self.col_is_correct_no_go]
+        
+        # 5. Valider les temps de réaction (pour les essais Go corrects uniquement)
+        min_rt_ms, max_rt_ms = rt_threshold_ms
+        # is_valid_rt ne s'applique qu'aux essais où un TR est attendu et enregistré
+        df[self.col_valid_rt] = df[self.col_rt].between(min_rt_ms, max_rt_ms, inclusive='both')
+        
+        # Mettre RT à NaN si ce n'est pas un Go correct OU si le RT est hors des seuils valides
+        # Cela assure que les calculs de TR moyen/médian ne considèrent que les TR pertinents.
+        df.loc[~(df[self.col_is_correct_go] & df[self.col_valid_rt]), self.col_rt] = np.nan
+
+        self.processed_data = df
+        self.results['preprocessing_summary'] = {
+            'total_trials_analyzed': len(df),
+            'num_target_trials (No-Go)': int(df[self.col_is_target].sum()),
+            'num_nontarget_trials (Go)': int((~df[self.col_is_target]).sum()),
+            'num_responses_interpreted_as_press': int(df['user_made_response'].sum()),
+            'rt_threshold_min_ms_used': min_rt_ms,
+            'rt_threshold_max_ms_used': max_rt_ms,
+            'response_value_for_press_used': response_value_for_press
+        }
+        print("  INFO (SARTAnalyzer): Prétraitement des données SART terminé.")
+
+    def calculate_basic_metrics(self):
+        """Calcule les métriques SART de base après prétraitement."""
+        if self.processed_data.empty:
+            raise ValueError("Les données doivent être prétraitées (`preprocess_data`) avant de calculer les métriques.")
+
+        df = self.processed_data
+        summary = self.results['preprocessing_summary']
+        num_targets = summary['num_target_trials (No-Go)']
+        num_nontargets = summary['num_nontarget_trials (Go)']
+        total_trials = summary['total_trials_analyzed']
+
+        commission_errors_count = df[self.col_is_commission].sum()
+        omission_errors_count = df[self.col_is_omission].sum()
+
+        # Taux d'erreur de commission (sur le nombre d'essais cibles/No-Go)
+        comm_err_rate = commission_errors_count / num_targets if num_targets > 0 else 0.0
+        
+        # Taux d'erreur d'omission (sur le nombre d'essais non-cibles/Go)
+        om_err_rate = omission_errors_count / num_nontargets if num_nontargets > 0 else 0.0
+
+        # Temps de réaction : self.col_rt contient déjà les TR valides (NaN sinon) pour les Go corrects
+        valid_rts_series = df[self.col_rt].dropna() # Séries de TR valides (Go corrects, dans les seuils)
+        
+        mean_rt_val = valid_rts_series.mean() if not valid_rts_series.empty else np.nan
+        median_rt_val = valid_rts_series.median() if not valid_rts_series.empty else np.nan
+        std_rt_val = valid_rts_series.std() if not valid_rts_series.empty else np.nan
+        
+        num_correct_trials = df[self.col_is_correct].sum()
+        overall_accuracy = num_correct_trials / total_trials if total_trials > 0 else 0.0
+
+        self.results.update({
+            'num_commission_errors': int(commission_errors_count),
+            'commission_error_rate': float(comm_err_rate),
+            'num_omission_errors': int(omission_errors_count),
+            'omission_error_rate': float(om_err_rate),
+            'mean_rt': float(mean_rt_val) if pd.notna(mean_rt_val) else None,
+            'median_rt': float(median_rt_val) if pd.notna(median_rt_val) else None,
+            'std_rt': float(std_rt_val) if pd.notna(std_rt_val) else None, # Pour 'rt_variability' dans le PDF
+            'num_correct_go_with_valid_rt': len(valid_rts_series),
+            'accuracy': float(overall_accuracy),
+        })
+        print("  INFO (SARTAnalyzer): Calcul des métriques de base terminé.")
+
+    def _sdt_correction_for_rate(self, rate, n_trials_for_rate):
+        """Correction pour les taux de 0 ou 1 dans les calculs SDT (loglinear)."""
+        if n_trials_for_rate == 0: return 0.5 # Cas limite, ou np.nan si on préfère
+        if rate == 0:
+            return 0.5 / n_trials_for_rate
+        if rate == 1:
+            return (n_trials_for_rate - 0.5) / n_trials_for_rate
+        return rate
+
+    def calculate_advanced_metrics(self):
+        """Calcule les métriques SART avancées (d', beta, CV des TR)."""
+        if 'mean_rt' not in self.results:
+            self.calculate_basic_metrics() # Assurer que les métriques de base sont disponibles
+
+        df = self.processed_data
+        summary = self.results['preprocessing_summary']
+        num_targets = summary['num_target_trials (No-Go)']       # N(Signal Present)
+        num_nontargets = summary['num_nontarget_trials (Go)'] # N(Signal Absent)
+
+        # Définitions SDT pour SART:
+        # - Signal Présent = Essai Cible (No-Go)
+        # - Signal Absent  = Essai Non-Cible (Go)
+        # - Hit (H) = Correctement inhiber la réponse à une Cible (Correct No-Go)
+        #             H_rate = N(Correct No-Go) / N(Cibles)
+        # - False Alarm (FA) = Incorrectement inhiber la réponse à un Non-Cible (Erreur d'Omission)
+        #             FA_rate = N(Omissions) / N(Non-Cibles)
+        
+        num_correct_no_go = df[self.col_is_correct_no_go].sum()
+        hit_rate_no_go = num_correct_no_go / num_targets if num_targets > 0 else 0.0
+        
+        num_omissions = self.results['num_omission_errors']
+        false_alarm_rate_omission = num_omissions / num_nontargets if num_nontargets > 0 else 0.0
+
+        # Appliquer la correction pour les taux extrêmes (0 ou 1)
+        h_corr = self._sdt_correction_for_rate(hit_rate_no_go, num_targets)
+        fa_corr = self._sdt_correction_for_rate(false_alarm_rate_omission, num_nontargets)
+
+        # Calcul de d' (d-prime) et beta
+        # Z-score (inverse de la fonction de répartition normale)
+        z_h = norm.ppf(h_corr)
+        z_fa = norm.ppf(fa_corr)
+        
+        d_prime_val = z_h - z_fa
+        # Beta: exp(-0.5 * (Z(H)^2 - Z(FA)^2) - C * (Z(H) - Z(FA))) où C = -0.5 * (Z(H) + Z(FA))
+        # Formule plus simple pour beta: exp( (Z(FA)^2 - Z(H)^2) / 2 )
+        # Ou: beta = exp(d_prime_val * criterion_c_val)
+        criterion_c_val = -0.5 * (z_h + z_fa) # Critère de réponse C
+        beta_val = np.exp(d_prime_val * criterion_c_val) if pd.notna(d_prime_val) and pd.notna(criterion_c_val) else np.nan
+        # Note: Beta peut aussi être calculé comme f(Z(H)) / f(Z(FA)) où f est la PDF normale.
+
+        # Coefficient de variation des TR (pour les Go corrects et valides)
+        mean_rt = self.results.get('mean_rt')
+        std_rt = self.results.get('std_rt')
+        rt_cv_val = (std_rt / mean_rt) if (mean_rt and mean_rt != 0 and pd.notna(std_rt)) else np.nan
+
+        self.results.update({
+            'd_prime': float(d_prime_val) if pd.notna(d_prime_val) else None,
+            'beta': float(beta_val) if pd.notna(beta_val) else None,
+            'criterion_c': float(criterion_c_val) if pd.notna(criterion_c_val) else None,
+            'hit_rate_for_sdt (correct_no_go_rate)': float(hit_rate_no_go),
+            'false_alarm_rate_for_sdt (omission_error_rate)': float(false_alarm_rate_omission),
+            'rt_cv': float(rt_cv_val) if pd.notna(rt_cv_val) else None,
+            # 'rt_variability' est déjà 'std_rt' stocké dans les métriques de base.
+        })
+        print("  INFO (SARTAnalyzer): Calcul des métriques avancées terminé.")
+
+    def analyze_time_on_task_effects(self, num_blocks=4):
+        """Analyse les effets du temps sur la tâche en divisant les essais en blocs."""
+        if self.processed_data.empty:
+            print("  AVERTISSEMENT (TimeOnTask): Données non prétraitées."); return
+        
+        df = self.processed_data
+        n_trials = len(df)
+        if n_trials < num_blocks * 2: # Pas assez de données pour des blocs significatifs
+            self.results['time_on_task'] = {}
+            print(f"  AVERTISSEMENT (TimeOnTask): Pas assez de données ({n_trials} essais) pour {num_blocks} blocs significatifs."); return
+
+        window_size = int(np.ceil(n_trials / num_blocks))
+        if window_size == 0: window_size = n_trials
+
+        block_results = []
+        for i in range(num_blocks):
+            start_idx = i * window_size
+            end_idx = min((i + 1) * window_size, n_trials)
+            block_df = df.iloc[start_idx:end_idx]
+
+            if block_df.empty: continue
+
+            block_label = f"Bloc {i+1}"
+            
+            # Métriques pour ce bloc (similaire à calculate_basic_metrics mais sur block_df)
+            b_num_targets = block_df[self.col_is_target].sum()
+            b_num_nontargets = (~block_df[self.col_is_target]).sum()
+            
+            b_comm = block_df[self.col_is_commission].sum()
+            b_om = block_df[self.col_is_omission].sum()
+            
+            b_comm_rate = b_comm / b_num_targets if b_num_targets > 0 else 0.0
+            b_om_rate = b_om / b_num_nontargets if b_num_nontargets > 0 else 0.0
+            
+            b_rts = block_df.loc[block_df[self.col_is_correct_go], self.col_rt].dropna() # TRs valides du bloc
+            b_mean_rt = b_rts.mean() if not b_rts.empty else np.nan
+            
+            b_correct = block_df[self.col_is_correct].sum()
+            b_accuracy = b_correct / len(block_df) if len(block_df) > 0 else 0.0
+            
+            block_results.append({
+                'block_label': block_label,
+                'mean_rt': b_mean_rt,
+                'accuracy': b_accuracy,
+                'commission_error_rate': b_comm_rate,
+                'omission_error_rate': b_om_rate
+            })
+
+        self.results['time_on_task'] = {
+            'num_blocks_analyzed': num_blocks,
+            'window_size_trials': window_size,
+            'block_data': block_results
+        }
+        print(f"  INFO (SARTAnalyzer): Analyse du temps sur la tâche ({num_blocks} blocs) terminée.")
+
+    def analyze_sequential_effects(self, n_back=1):
+        """Analyse les effets séquentiels (influence de l'essai N-1 sur l'essai N Go)."""
+        if n_back != 1:
+            print("  AVERTISSEMENT (SequentialEffects): Supporte uniquement n_back=1 pour l'instant."); return
+        if self.processed_data.empty:
+            print("  AVERTISSEMENT (SequentialEffects): Données non prétraitées."); return
+
+        df = self.processed_data.copy()
+        if len(df) < n_back + 1:
+            self.results['sequential_effects'] = {}
+            print(f"  AVERTISSEMENT (SequentialEffects): Pas assez de données ({len(df)} essais) pour n_back={n_back}."); return
+
+        # Caractéristiques de l'essai N-1
+        df['prev_is_target'] = df[self.col_is_target].shift(n_back)
+        # On pourrait ajouter d'autres: prev_is_commission, prev_is_omission, etc.
+
+        # Analyser uniquement les essais Go courants (non-cibles) pour lesquels l'essai N-1 existe
+        current_go_trials_with_prev = df[~df[self.col_is_target] & df['prev_is_target'].notna()].copy()
+        
+        if current_go_trials_with_prev.empty:
+            self.results['sequential_effects'] = {}
+            print("  AVERTISSEMENT (SequentialEffects): Aucun essai Go courant avec un essai N-1 valide trouvé."); return
+
+        # TR des essais Go courants en fonction du type de l'essai N-1
+        rt_go_after_prev_target = current_go_trials_with_prev[current_go_trials_with_prev['prev_is_target'] == True][self.col_rt].mean()
+        rt_go_after_prev_nontarget = current_go_trials_with_prev[current_go_trials_with_prev['prev_is_target'] == False][self.col_rt].mean()
+        
+        # Précision des essais Go courants (1 - taux d'omission) en fonction du type de l'essai N-1
+        # Taux d'omission pour les essais Go courants après une cible N-1
+        om_rate_go_after_prev_target = current_go_trials_with_prev[current_go_trials_with_prev['prev_is_target'] == True][self.col_is_omission].mean()
+        acc_go_after_prev_target = 1.0 - om_rate_go_after_prev_target if pd.notna(om_rate_go_after_prev_target) else np.nan
+        
+        om_rate_go_after_prev_nontarget = current_go_trials_with_prev[current_go_trials_with_prev['prev_is_target'] == False][self.col_is_omission].mean()
+        acc_go_after_prev_nontarget = 1.0 - om_rate_go_after_prev_nontarget if pd.notna(om_rate_go_after_prev_nontarget) else np.nan
+
+        self.results['sequential_effects'] = {
+            f'rt_current_go_after_prev_target_n{n_back}': float(rt_go_after_prev_target) if pd.notna(rt_go_after_prev_target) else None,
+            f'rt_current_go_after_prev_nontarget_n{n_back}': float(rt_go_after_prev_nontarget) if pd.notna(rt_go_after_prev_nontarget) else None,
+            f'accuracy_current_go_after_prev_target_n{n_back}': float(acc_go_after_prev_target) if pd.notna(acc_go_after_prev_target) else None,
+            f'accuracy_current_go_after_prev_nontarget_n{n_back}': float(acc_go_after_prev_nontarget) if pd.notna(acc_go_after_prev_nontarget) else None,
+        }
+        print(f"  INFO (SARTAnalyzer): Analyse des effets séquentiels (n_back={n_back}) terminée.")
+
+    def export_results(self, filepath):
+        """Exporte les résultats (self.results) dans un fichier JSON."""
+        def default_converter(o): # Gérer les types numpy pour JSON
+            if isinstance(o, np.integer): return int(o)
+            if isinstance(o, np.floating): return float(o) if pd.notna(o) else None
+            if isinstance(o, np.ndarray): return o.tolist()
+            if pd.isna(o): return None
+            return str(o) # Fallback pour d'autres types non sérialisables
+
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(self.results, f, indent=4, default=default_converter, ensure_ascii=False)
+            print(f"  INFO (SARTAnalyzer): Résultats exportés avec succès vers {filepath}")
+        except Exception as e:
+            print(f"  ERREUR (SARTAnalyzer): Échec de l'exportation des résultats en JSON: {e}")
+
+    def generate_report(self, filepath):
+        """Génère un rapport textuel simple (Markdown) des résultats."""
+        # Cette fonction est appelée par prog.py si on décommente les lignes associées.
+        # Le rapport PDF est le principal, mais ceci peut être un plus.
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write("# Rapport d'Analyse SART (Texte)\n\n")
+                # ... (Contenu du rapport textuel, similaire à la version précédente) ...
+                f.write("## Résumé du Prétraitement\n")
+                for key, value in self.results.get('preprocessing_summary', {}).items():
+                    f.write(f"- {key.replace('_', ' ').capitalize()}: {value}\n")
+                f.write("\n## Métriques Principales\n")
+                # ... etc. ...
+            print(f"  INFO (SARTAnalyzer): Rapport textuel généré: {filepath}")
+        except Exception as e:
+            print(f"  ERREUR (SARTAnalyzer): Échec de la génération du rapport textuel: {e}")
+
+    # --- Méthodes de Visualisation (Plotting) ---
+    def plot_basic_metrics(self):
+        """Génère un graphique des métriques de base."""
+        if 'accuracy' not in self.results: self.calculate_basic_metrics()
+        labels = ['Précision', 'Err. Commission', 'Err. Omission']
+        values = [self.results.get('accuracy', 0), self.results.get('commission_error_rate', 0), self.results.get('omission_error_rate', 0)]
+        
+        fig, ax = plt.subplots(figsize=(7, 5)) # Taille ajustée
+        bars = ax.bar(labels, values, color=['#4299E1', '#F56565', '#F6E05E']) # Couleurs Tailwind-like
+        ax.set_ylabel('Taux (0-1)')
+        ax.set_title('Métriques de Performance SART (Base)', fontsize=12)
+        ax.set_ylim(0, max(0.1, min(1.05, max(values) * 1.2 if any(v > 0 for v in values) else 0.1))) # Limite Y dynamique
+        ax.grid(axis='y', linestyle='--', alpha=0.7)
+        for bar in bars:
+            yval = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2.0, yval + 0.01, f'{yval:.2%}', ha='center', va='bottom', fontsize=9)
+        plt.tight_layout()
+        return fig
+
+    def plot_advanced_metrics(self):
+        """Génère un graphique des métriques avancées."""
+        if 'd_prime' not in self.results: self.calculate_advanced_metrics()
+        labels = ["d' (Sensibilité)", "β (Biais)", "CV des TR"]
+        values = [self.results.get('d_prime'), self.results.get('beta'), self.results.get('rt_cv')]
+        # Remplacer None par 0 pour le tracé, mais indiquer N/A
+        plot_values = [v if pd.notna(v) else 0 for v in values]
+
+        fig, ax = plt.subplots(figsize=(7, 5))
+        bars = ax.bar(labels, plot_values, color=['#667EEA', '#ECC94B', '#9F7AEA'])
+        ax.set_ylabel('Valeur')
+        ax.set_title('Métriques SART Avancées', fontsize=12)
+        ax.grid(axis='y', linestyle='--', alpha=0.7)
+        for i, bar in enumerate(bars):
+            yval_orig = values[i] # Valeur originale pour l'étiquette
+            yval_plot = bar.get_height()
+            label_text = f'{yval_orig:.2f}' if pd.notna(yval_orig) else "N/A"
+            ax.text(bar.get_x() + bar.get_width()/2.0, yval_plot + 0.02 * np.sign(yval_plot) if yval_plot !=0 else 0.02, 
+                    label_text, ha='center', va='bottom' if yval_plot >=0 else 'top', fontsize=9)
+        plt.tight_layout()
+        return fig
+
+    def plot_sequential_effects(self):
+        """Génère des graphiques pour les effets séquentiels (RT et Précision des essais Go)."""
+        if 'sequential_effects' not in self.results or not self.results['sequential_effects']:
+             self.analyze_sequential_effects() # Tenter de calculer
+        
+        seq_res = self.results.get('sequential_effects', {})
+        if not seq_res: # Si toujours vide après tentative
+             fig, ax = plt.subplots(figsize=(7,5)); ax.text(0.5, 0.5, "Données insuffisantes ou effets séquentiels non calculés.", ha='center', va='center', wrap=True, fontsize=10); return fig
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5)) # Taille ajustée
+        fig.suptitle('Effets Séquentiels (N-1) sur Essais Go Actuels', fontsize=13)
+
+        rt_labels = ['Après Cible N-1', 'Après Non-Cible N-1']
+        rt_values = [seq_res.get('rt_current_go_after_prev_target_n1'), seq_res.get('rt_current_go_after_prev_nontarget_n1')]
+        plot_rt_values = [v if pd.notna(v) else 0 for v in rt_values]
+        bars_rt = axes[0].bar(rt_labels, plot_rt_values, color=['#ED8936', '#48BB78'])
+        axes[0].set_ylabel('TR Moyen (ms)')
+        axes[0].set_title('Temps de Réaction', fontsize=10)
+        axes[0].grid(axis='y', linestyle='--', alpha=0.7)
+        for i, bar in enumerate(bars_rt):
+            label_text = f"{rt_values[i]:.0f}" if pd.notna(rt_values[i]) else "N/A"
+            axes[0].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 5, label_text, ha='center', va='bottom', fontsize=9)
+
+        acc_labels = ['Après Cible N-1', 'Après Non-Cible N-1']
+        acc_values = [seq_res.get('accuracy_current_go_after_prev_target_n1'), seq_res.get('accuracy_current_go_after_prev_nontarget_n1')]
+        plot_acc_values = [v if pd.notna(v) else 0 for v in acc_values]
+        bars_acc = axes[1].bar(acc_labels, plot_acc_values, color=['#ED8936', '#48BB78'])
+        axes[1].set_ylabel('Précision (1 - Taux Omission)')
+        axes[1].set_title('Précision', fontsize=10)
+        axes[1].set_ylim(0, max(0.1, min(1.05, max(plot_acc_values) * 1.2 if any(v > 0 for v in plot_acc_values) else 0.1)))
+        axes[1].grid(axis='y', linestyle='--', alpha=0.7)
+        for i, bar in enumerate(bars_acc):
+            label_text = f"{acc_values[i]:.2%}" if pd.notna(acc_values[i]) else "N/A"
+            axes[1].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01, label_text, ha='center', va='bottom', fontsize=9)
+        
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        return fig
+
+    def plot_time_on_task(self):
+        """Génère un graphique des effets du temps sur la tâche (performance par blocs)."""
+        if 'time_on_task' not in self.results or not self.results['time_on_task'].get('block_data'):
+            self.analyze_time_on_task_effects() # Tenter de calculer
+
+        tot_data = self.results.get('time_on_task', {})
+        block_data_list = tot_data.get('block_data', [])
+
+        if not block_data_list:
+            fig, ax = plt.subplots(figsize=(7,5)); ax.text(0.5, 0.5, "Données insuffisantes ou analyse du temps sur tâche non effectuée.", ha='center', va='center', wrap=True, fontsize=10); return fig
+
+        labels = [b['block_label'] for b in block_data_list]
+        rt_trend = [b['mean_rt'] for b in block_data_list]
+        accuracy_trend = [b['accuracy'] for b in block_data_list]
+        commission_trend = [b['commission_error_rate'] for b in block_data_list]
+        omission_trend = [b['omission_error_rate'] for b in block_data_list]
+        
+        fig, ax1 = plt.subplots(figsize=(10, 6)) # Taille ajustée
+        fig.suptitle('Performance au Fil du Temps (par Blocs)', fontsize=13)
+
+        # Axe des TR
+        color_rt = 'orangered'
+        ax1.set_xlabel(f"Blocs d'Essais (taille approx. {tot_data.get('window_size_trials', 'N/A')} essais)", fontsize=10)
+        ax1.set_ylabel('TR Moyen (ms)', color=color_rt, fontsize=10)
+        line_rt, = ax1.plot(labels, rt_trend, color=color_rt, marker='o', linestyle='-', linewidth=2, label='TR Moyen')
+        ax1.tick_params(axis='y', labelcolor=color_rt)
+        ax1.grid(True, axis='y', linestyle=':', alpha=0.5)
+
+        # Axe pour les taux (précision, erreurs)
+        ax2 = ax1.twinx()
+        color_acc = 'forestgreen'
+        color_comm = 'royalblue'
+        color_om = 'mediumpurple'
+        ax2.set_ylabel('Taux (Précision, Erreurs)', color=color_acc, fontsize=10)
+        line_acc, = ax2.plot(labels, accuracy_trend, color=color_acc, marker='s', linestyle='--', label='Précision Globale')
+        line_comm, = ax2.plot(labels, commission_trend, color=color_comm, marker='^', linestyle='--', label='Taux Err. Commission')
+        line_om, = ax2.plot(labels, omission_trend, color=color_om, marker='x', linestyle='--', label='Taux Err. Omission')
+        ax2.tick_params(axis='y', labelcolor=color_acc)
+        ax2.set_ylim(0, 1.05) # Taux entre 0 et 1
+
+        # Légendes combinées
+        all_lines = [line_rt, line_acc, line_comm, line_om]
+        all_labels = [l.get_label() for l in all_lines]
+        ax1.legend(all_lines, all_labels, loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=2, fontsize=9)
+
+        plt.xticks(rotation=30, ha="right", fontsize=9)
+        fig.tight_layout(rect=[0, 0.08, 1, 0.95]) # Ajuster pour suptitle et légende en bas
+        return fig
+
+# --- Fin de la classe SARTAnalyzer ---
+
+if __name__ == '__main__':
+    # Bloc d'exemple pour tester le module directement (ne s'exécute pas si importé)
+    print("Module SARTAnalyzer chargé.")
+    print("Ce fichier est un module et est destiné à être importé par un script principal (comme prog.py).")
+    print("Exécution d'un test de démonstration interne...")
+
+    # Création de données de démonstration (similaire à celles dans prog.py)
+    n_trials_demo = 100
+    stimuli_demo = np.random.choice(np.arange(1, 10), n_trials_demo)
+    target_stim_demo = 3
+    
+    responses_demo = []
+    rts_demo_ms = []
+    for stim in stimuli_demo:
+        if stim == target_stim_demo: # No-Go
+            if np.random.rand() < 0.25: responses_demo.append(1); rts_demo_ms.append(np.random.randint(200, 500)) # Commission
+            else: responses_demo.append(0); rts_demo_ms.append(np.nan) # Correct No-Go
+        else: # Go
+            if np.random.rand() < 0.15: responses_demo.append(0); rts_demo_ms.append(np.nan) # Omission
+            else: responses_demo.append(1); rts_demo_ms.append(np.random.randint(250, 800)) # Correct Go
+            
+    demo_raw_df = pd.DataFrame({
+        'NumeroStim': stimuli_demo,         # Sera 'stimulus'
+        'AppuiTouche': responses_demo,      # Sera 'response'
+        'TempsReaction_En_MS': rts_demo_ms  # Sera 'reaction_time'
+    })
+
+    analyzer_test = SARTAnalyzer()
+    analyzer_test.raw_data = demo_raw_df # Assigner les données brutes
+
+    demo_mapping = {
+        'NumeroStim': 'stimulus',
+        'AppuiTouche': 'response',
+        'TempsReaction_En_MS': 'reaction_time'
+    }
+
+    print("\n--- Test Prétraitement (SARTAnalyzer) ---")
+    try:
+        analyzer_test.preprocess_data(
+            target_stimulus=target_stim_demo, # int 3
+            column_mapping=demo_mapping,
+            response_value_for_press=1, # AppuiTouche=1 signifie un appui
+            rt_threshold_ms=(100, 1500)
+        )
+        print("  Données prétraitées avec succès par SARTAnalyzer.")
+        print("  Résumé du prétraitement:", analyzer_test.results.get('preprocessing_summary'))
+        # print(analyzer_test.processed_data.head())
+    except Exception as e:
+        print(f"  ERREUR lors du test de prétraitement: {e}")
+        import traceback; traceback.print_exc()
+
+    if not analyzer_test.processed_data.empty:
+        print("\n--- Test Calcul Métriques (SARTAnalyzer) ---")
+        try:
+            analyzer_test.calculate_basic_metrics()
+            analyzer_test.calculate_advanced_metrics()
+            print("  Métriques calculées. Extrait:")
+            for k in ['accuracy', 'commission_error_rate', 'omission_error_rate', 'mean_rt', 'd_prime', 'rt_cv']:
+                print(f"    {k}: {analyzer_test.results.get(k)}")
+        except Exception as e:
+            print(f"  ERREUR lors du test de calcul des métriques: {e}")
+
+        print("\n--- Test Analyses Post-Hoc (SARTAnalyzer) ---")
+        try:
+            analyzer_test.analyze_time_on_task_effects(num_blocks=3)
+            # print("  Temps sur tâche:", analyzer_test.results.get('time_on_task'))
+            analyzer_test.analyze_sequential_effects(n_back=1)
+            # print("  Effets séquentiels:", analyzer_test.results.get('sequential_effects'))
+            print("  Analyses post-hoc exécutées.")
+        except Exception as e:
+            print(f"  ERREUR lors des analyses post-hoc: {e}")
+
+        print("\n--- Test Génération Graphiques (SARTAnalyzer) ---")
+        # Les graphiques ne seront pas affichés, mais leur création est testée.
+        try:
+            figs_test = [
+                analyzer_test.plot_basic_metrics(),
+                analyzer_test.plot_advanced_metrics(),
+                analyzer_test.plot_sequential_effects(),
+                analyzer_test.plot_time_on_task()
+            ]
+            for i, fig in enumerate(figs_test):
+                if fig: 
+                    print(f"  Figure de test {i+1} générée.")
+                    plt.close(fig) # Fermer pour économiser mémoire
+                else:
+                    print(f"  Figure de test {i+1} non générée (probablement données insuffisantes).")
+            plt.close('all')
+        except Exception as e:
+            print(f"  ERREUR lors de la génération des figures de test: {e}")
+        
+        print("\n--- Test Export & Rapport (SARTAnalyzer) ---")
+        try:
+            analyzer_test.export_results("sart_analyzer_demo_results.json")
+            analyzer_test.generate_report("sart_analyzer_demo_report.md")
+        except Exception as e:
+             print(f"  ERREUR lors de l'export/rapport de test: {e}")
+    else:
+        print("\nPrétraitement des données de démo a échoué, tests suivants non exécutés.")
+    
+    print("\nFin du test de démonstration interne de SARTAnalyzer.")
