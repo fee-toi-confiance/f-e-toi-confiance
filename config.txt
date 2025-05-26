@@ -1,0 +1,4 @@
+Type: TXT
+Nom: _github-pages-challenge-votrenom
+Valeur: 1234567890abcdef (exemple de code)
+TTL: 3600
