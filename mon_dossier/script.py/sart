@@ -1,0 +1,610 @@
+import tkinter as tk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
+import random
+import time
+import csv
+import os
+from datetime import datetime
+
+class SARTApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Test d'attention soutenue SART")
+        self.root.geometry("800x600")
+        
+        # Variables pour identifier le participant
+        self.participant_id = ""
+        self.session_id = ""
+        
+        # Configuration des frames
+        self.setup_frames()
+        
+        # Variables de test
+        self.numbers = [str(i) for i in range(1, 10)] * 25
+        random.shuffle(self.numbers)
+        self.current = -1
+        self.results = []
+        self.waiting_for_response = False
+        self.showing_number = False
+        self.start_time = None
+        self.response_made = False
+        self.task_running = False
+        self.max_duration = 240  # 4 minutes en secondes
+        self.global_start_time = None
+
+        # Durées en ms - paramètres ajustés
+        self.display_time = 500   # 500 ms chiffre affiché
+        self.blank_time = 650     # 650 ms blanc (pour un ISI total de 1150 ms)
+        self.initial_delay = 5000  # 5 secondes de délai initial
+        
+        # Timing des événements
+        self.next_event_time = 0
+        self.last_number_time = 0
+        
+        # Statistiques
+        self.stats = {
+            "total_go": 0,
+            "total_nogo": 0,
+            "correct_go": 0,
+            "correct_nogo": 0,
+            "commission_errors": 0,
+            "omission_errors": 0,
+            "mean_rt": 0,
+            "total_rt": 0,
+            "rt_count": 0
+        }
+        
+        # Afficher l'écran d'introduction en premier
+        self.show_introduction_screen()
+
+    def setup_frames(self):
+        """Configuration des différents frames de l'interface"""
+        # Frame pour l'introduction
+        self.intro_frame = tk.Frame(self.root)
+        
+        # Frame pour les informations participant
+        self.participant_frame = tk.Frame(self.root)
+        
+        # Frame pour les consignes
+        self.instructions_frame = tk.Frame(self.root)
+        
+        # Frame pour le test principal
+        self.test_frame = tk.Frame(self.root)
+        
+        # Frame pour les résultats
+        self.results_frame = tk.Frame(self.root)
+        
+        # Configuration initiale des frames
+        self.setup_intro_frame()
+        self.setup_participant_frame()
+        self.setup_instructions_frame()
+        self.setup_test_frame()
+        self.setup_results_frame()
+
+    def setup_intro_frame(self):
+        """Configuration de l'écran d'introduction"""
+        title_label = tk.Label(self.intro_frame, text="Test d'Attention Soutenue aux Réponses (SART)", 
+                              font=("Arial", 20, "bold"))
+        title_label.pack(pady=20)
+        
+        intro_text = """Ce test mesure votre capacité d'attention soutenue.
+
+Des chiffres vont apparaître à l'écran un par un.
+Votre tâche est d'appuyer sur la barre d'espace chaque fois qu'un chiffre apparaît, 
+SAUF quand le chiffre "3" est présenté.
+
+Ce test dure environ 4 minutes.
+"""
+        intro_label = tk.Label(self.intro_frame, text=intro_text, font=("Arial", 14))
+        intro_label.pack(pady=20)
+        
+        start_button = tk.Button(self.intro_frame, text="Continuer", 
+                                command=self.show_participant_screen, 
+                                font=("Arial", 14), width=15)
+        start_button.pack(pady=20)
+
+    def setup_participant_frame(self):
+        """Configuration de l'écran d'informations du participant"""
+        title_label = tk.Label(self.participant_frame, text="Informations du participant", 
+                              font=("Arial", 20, "bold"))
+        title_label.pack(pady=20)
+        
+        # Frame pour les champs de saisie
+        input_frame = tk.Frame(self.participant_frame)
+        input_frame.pack(pady=20)
+        
+        # Identifiant du participant
+        id_label = tk.Label(input_frame, text="ID Participant:", font=("Arial", 14))
+        id_label.grid(row=0, column=0, padx=10, pady=10, sticky="e")
+        
+        self.id_entry = tk.Entry(input_frame, font=("Arial", 14), width=20)
+        self.id_entry.grid(row=0, column=1, padx=10, pady=10, sticky="w")
+        
+        # Boutons
+        button_frame = tk.Frame(self.participant_frame)
+        button_frame.pack(pady=20)
+        
+        back_button = tk.Button(button_frame, text="Retour", 
+                              command=self.show_introduction_screen, 
+                              font=("Arial", 14), width=10)
+        back_button.grid(row=0, column=0, padx=20)
+        
+        continue_button = tk.Button(button_frame, text="Continuer", 
+                                  command=self.validate_participant_info, 
+                                  font=("Arial", 14), width=10)
+        continue_button.grid(row=0, column=1, padx=20)
+
+    def setup_instructions_frame(self):
+        """Configuration de l'écran des consignes"""
+        title_label = tk.Label(self.instructions_frame, text="Instructions détaillées", 
+                              font=("Arial", 20, "bold"))
+        title_label.pack(pady=20)
+        
+        # Zone de texte défilante pour les instructions
+        instructions_text = scrolledtext.ScrolledText(self.instructions_frame, 
+                                                    width=70, height=15, 
+                                                    font=("Arial", 12))
+        instructions_text.pack(pady=10)
+        
+        instructions = """INSTRUCTIONS DU TEST SART
+
+1. Des chiffres de 1 à 9 vont apparaître à l'écran un par un.
+
+2. Votre tâche est d'appuyer sur la BARRE D'ESPACE chaque fois qu'un chiffre apparaît, SAUF quand le chiffre "3" est présenté.
+
+3. Quand vous voyez le chiffre "3", vous ne devez PAS appuyer sur la barre d'espace.
+
+4. Les chiffres apparaîtront rapidement. Essayez d'être aussi précis et rapide que possible.
+
+5. Ce test mesure votre capacité à maintenir votre attention sur une tâche répétitive.
+
+6. Le test durera environ 4 minutes.
+
+7. Avant le début du test, vous aurez un compte à rebours de 5 secondes pour vous préparer.
+
+8. Essayez de rester concentré pendant toute la durée du test.
+
+9. À la fin du test, vos résultats seront analysés et vous pourrez les exporter.
+
+IMPORTANT :
+- Maintenir un rythme régulier est plus important que d'être très rapide
+- Essayez de ne pas anticiper l'apparition du chiffre "3"
+- Restez attentif tout au long du test même si la tâche devient monotone
+"""
+        instructions_text.insert(tk.INSERT, instructions)
+        instructions_text.config(state="disabled")
+        
+        # Checkbox de validation
+        self.validate_var = tk.IntVar()
+        validate_check = tk.Checkbutton(self.instructions_frame, 
+                                      text="J'ai lu et compris les instructions", 
+                                      variable=self.validate_var, 
+                                      font=("Arial", 12))
+        validate_check.pack(pady=10)
+        
+        # Boutons
+        button_frame = tk.Frame(self.instructions_frame)
+        button_frame.pack(pady=20)
+        
+        back_button = tk.Button(button_frame, text="Retour", 
+                              command=self.show_participant_screen, 
+                              font=("Arial", 14), width=10)
+        back_button.grid(row=0, column=0, padx=20)
+        
+        self.start_test_button = tk.Button(button_frame, text="Commencer le test", 
+                                         command=self.validate_instructions, 
+                                         font=("Arial", 14), width=15, 
+                                         state=tk.DISABLED)
+        self.start_test_button.grid(row=0, column=1, padx=20)
+        
+        # Activer/désactiver le bouton en fonction de la case à cocher
+        self.validate_var.trace_add("write", self.update_start_button)
+
+    def setup_test_frame(self):
+        """Configuration de l'écran de test"""
+        self.label = tk.Label(self.test_frame, text="", font=("Arial", 72))
+        self.label.pack(expand=True)
+        
+        self.info_label = tk.Label(self.test_frame, text="", font=("Arial", 18))
+        self.info_label.pack()
+        
+        # Bind de la touche espace
+        self.root.bind("<space>", self.on_space)
+
+    def setup_results_frame(self):
+        """Configuration de l'écran des résultats"""
+        title_label = tk.Label(self.results_frame, text="Résultats du test", 
+                              font=("Arial", 20, "bold"))
+        title_label.pack(pady=20)
+        
+        # Frame pour afficher les statistiques
+        stats_frame = tk.Frame(self.results_frame)
+        stats_frame.pack(pady=20, fill="both", expand=True)
+        
+        # Création d'un style pour les étiquettes
+        style = ttk.Style()
+        style.configure("Stats.TLabel", font=("Arial", 12))
+        
+        # Colonnes pour les statistiques
+        left_stats = tk.Frame(stats_frame)
+        left_stats.pack(side="left", padx=20, expand=True)
+        
+        right_stats = tk.Frame(stats_frame)
+        right_stats.pack(side="right", padx=20, expand=True)
+        
+        # Labels pour les statistiques (à gauche)
+        self.go_trials_label = tk.Label(left_stats, text="Essais Go (tous sauf 3): 0", font=("Arial", 12))
+        self.go_trials_label.pack(anchor="w", pady=5)
+        
+        self.nogo_trials_label = tk.Label(left_stats, text="Essais No-Go (chiffre 3): 0", font=("Arial", 12))
+        self.nogo_trials_label.pack(anchor="w", pady=5)
+        
+        self.correct_go_label = tk.Label(left_stats, text="Réponses correctes Go: 0 (0%)", font=("Arial", 12))
+        self.correct_go_label.pack(anchor="w", pady=5)
+        
+        self.correct_nogo_label = tk.Label(left_stats, text="Inhibitions correctes No-Go: 0 (0%)", font=("Arial", 12))
+        self.correct_nogo_label.pack(anchor="w", pady=5)
+        
+        # Labels pour les statistiques (à droite)
+        self.commission_errors_label = tk.Label(right_stats, text="Erreurs de commission: 0 (0%)", font=("Arial", 12))
+        self.commission_errors_label.pack(anchor="w", pady=5)
+        
+        self.omission_errors_label = tk.Label(right_stats, text="Erreurs d'omission: 0 (0%)", font=("Arial", 12))
+        self.omission_errors_label.pack(anchor="w", pady=5)
+        
+        self.rt_label = tk.Label(right_stats, text="Temps de réaction moyen: 0 ms", font=("Arial", 12))
+        self.rt_label.pack(anchor="w", pady=5)
+        
+        # Boutons des résultats
+        button_frame = tk.Frame(self.results_frame)
+        button_frame.pack(pady=20)
+        
+        self.export_btn = tk.Button(button_frame, text="Exporter CSV",
+                                  command=self.export_csv, 
+                                  font=("Arial", 14), width=15)
+        self.export_btn.grid(row=0, column=0, padx=20)
+        
+        restart_btn = tk.Button(button_frame, text="Nouveau test", 
+                              command=self.show_introduction_screen,
+                              font=("Arial", 14), width=15)
+        restart_btn.grid(row=0, column=1, padx=20)
+    
+    def show_introduction_screen(self):
+        """Affiche l'écran d'introduction"""
+        # Cacher les autres frames
+        self.participant_frame.pack_forget()
+        self.instructions_frame.pack_forget()
+        self.test_frame.pack_forget()
+        self.results_frame.pack_forget()
+        
+        # Afficher l'écran d'introduction
+        self.intro_frame.pack(fill="both", expand=True)
+        
+        # Réinitialiser le test
+        self.reset_test()
+    
+    def show_participant_screen(self):
+        """Affiche l'écran des informations participant"""
+        self.intro_frame.pack_forget()
+        self.participant_frame.pack(fill="both", expand=True)
+    
+    def show_instructions_screen(self):
+        """Affiche l'écran des consignes"""
+        self.participant_frame.pack_forget()
+        self.instructions_frame.pack(fill="both", expand=True)
+        
+        # Activer/désactiver le bouton en fonction de la case à cocher
+        self.update_start_button()
+    
+    def show_test_screen(self):
+        """Affiche l'écran de test"""
+        self.instructions_frame.pack_forget()
+        self.test_frame.pack(fill="both", expand=True)
+        
+        # Démarrer le test
+        self.start()
+    
+    def show_results_screen(self):
+        """Affiche l'écran des résultats"""
+        self.test_frame.pack_forget()
+        self.results_frame.pack(fill="both", expand=True)
+        
+        # Afficher les statistiques
+        self.calculate_statistics()
+        self.update_statistics_display()
+    
+    def validate_participant_info(self):
+        """Valide les informations du participant"""
+        self.participant_id = self.id_entry.get().strip()
+        
+        if not self.participant_id:
+            messagebox.showwarning("Information manquante", "Veuillez entrer un identifiant pour le participant.")
+            return
+        
+        # Générer un ID de session (timestamp)
+        self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Passer aux instructions
+        self.show_instructions_screen()
+    
+    def update_start_button(self, *args):
+        """Met à jour l'état du bouton de démarrage du test"""
+        if self.validate_var.get():
+            self.start_test_button.config(state=tk.NORMAL)
+        else:
+            self.start_test_button.config(state=tk.DISABLED)
+    
+    def validate_instructions(self):
+        """Valide que les instructions ont été lues"""
+        if self.validate_var.get():
+            self.show_test_screen()
+        else:
+            messagebox.showwarning("Validation requise", 
+                                 "Veuillez confirmer que vous avez lu et compris les instructions.")
+    
+    def reset_test(self):
+        """Réinitialise les variables du test"""
+        self.numbers = [str(i) for i in range(1, 10)] * 25
+        random.shuffle(self.numbers)
+        self.current = -1
+        self.results = []
+        self.waiting_for_response = False
+        self.showing_number = False
+        self.task_running = False
+        
+        # Réinitialiser les statistiques
+        self.stats = {
+            "total_go": 0,
+            "total_nogo": 0,
+            "correct_go": 0,
+            "correct_nogo": 0,
+            "commission_errors": 0,
+            "omission_errors": 0,
+            "mean_rt": 0,
+            "total_rt": 0,
+            "rt_count": 0
+        }
+        
+        # Réinitialiser la case à cocher
+        if hasattr(self, 'validate_var'):
+            self.validate_var.set(0)
+
+    def start(self):
+        """Démarre le test SART"""
+        self.results = []
+        self.current = -1
+        self.numbers = [str(i) for i in range(1, 10)] * 25
+        random.shuffle(self.numbers)
+        self.showing_number = False
+        self.label.config(text="")
+        self.task_running = True
+        self.global_start_time = time.time()
+        self.next_event_time = time.time() * 1000  # Conversion en ms
+        
+        # Afficher le compte à rebours de 5 secondes
+        self.countdown_start_time = time.time()
+        self.update_countdown()
+
+    def update_countdown(self):
+        """Met à jour le compte à rebours avant le début du test"""
+        if not self.task_running:
+            return
+            
+        elapsed = time.time() - self.countdown_start_time
+        remaining = max(0, 5 - int(elapsed))
+        
+        if remaining > 0:
+            self.info_label.config(text=f"Le test commencera dans {remaining} secondes. Préparez-vous...")
+            self.root.after(1000, self.update_countdown)  # Mettre à jour chaque seconde
+        else:
+            self.info_label.config(text="")
+            # Commencer le test après le délai initial
+            self.root.after(100, self.show_next_number)
+
+    def update_progress(self):
+        """Met à jour l'affichage du temps écoulé"""
+        if not self.task_running:
+            return
+            
+        elapsed = time.time() - self.global_start_time
+        if elapsed <= self.max_duration:
+            # Mise à jour du label de temps
+            minutes = int(elapsed) // 60
+            seconds = int(elapsed) % 60
+            self.time_label.config(text=f"Temps écoulé: {minutes}:{seconds:02d} / 4:00")
+            
+            # Programmer la prochaine mise à jour
+            self.root.after(1000, self.update_progress)
+        else:
+            # Fin du test par timeout
+            if self.task_running:  # Éviter de terminer deux fois
+                self.end_task()
+
+    def show_next_number(self):
+        """Affiche le prochain chiffre"""
+        if not self.task_running:
+            return
+            
+        elapsed = time.time() - self.global_start_time
+        if elapsed >= self.max_duration or self.current + 1 >= len(self.numbers):
+            self.end_task()
+            return
+
+        # Incrémentation du compteur et affichage du chiffre
+        self.current += 1
+        self.label.config(text=self.numbers[self.current])
+        self.waiting_for_response = True
+        self.response_made = False
+        self.start_time = time.time()
+        self.showing_number = True
+        
+        # Définir le moment où le chiffre doit disparaître
+        if self.current == 0:  # Premier chiffre
+            self.next_event_time = time.time() * 1000 + self.display_time
+        else:
+            self.next_event_time += self.display_time
+            
+        # Programmer la disparition du chiffre
+        self.root.after(self.display_time, self.hide_number)
+
+    def hide_number(self):
+        """Masque le chiffre après le temps d'affichage"""
+        if not self.task_running:
+            return
+            
+        # Fin de l'affichage du chiffre : vérifier omission
+        chiffre = self.numbers[self.current]
+        rt = ""  # Pas de temps de réaction
+        trial_type = "No-Go" if chiffre == "3" else "Go"
+        if not self.response_made:
+            if trial_type == "Go":
+                result = "Erreur d'omission"
+            else:
+                result = "Réponse correcte"
+            self.results.append((self.current + 1, chiffre, rt, trial_type, result))
+        self.label.config(text="")
+        self.waiting_for_response = False
+        self.showing_number = False
+
+        elapsed = time.time() - self.global_start_time
+        if elapsed >= self.max_duration or self.current + 1 >= len(self.numbers):
+            self.end_task()
+            return
+
+        # Mise à jour du prochain temps d'affichage et programmation du prochain chiffre
+        self.next_event_time += self.blank_time
+        self.root.after(self.blank_time, self.show_next_number)
+
+    def end_task(self):
+        """Termine le test et passe à l'écran des résultats"""
+        self.task_running = False
+        self.root.unbind("<space>")  # Désactiver la touche espace
+        self.show_results_screen()
+
+    def on_space(self, event):
+        """Gère l'appui sur la barre d'espace"""
+        if self.waiting_for_response and not self.response_made and self.task_running:
+            rt = time.time() - self.start_time
+            chiffre = self.numbers[self.current]
+            trial_type = "No-Go" if chiffre == "3" else "Go"
+            if trial_type == "No-Go":
+                result = "Erreur de commission"
+            else:
+                result = "Réponse correcte"
+            self.results.append((self.current + 1, chiffre, rt, trial_type, result))
+            self.response_made = True
+
+    def calculate_statistics(self):
+        """Calcule les statistiques à partir des résultats"""
+        if not self.results:
+            return
+            
+        # Réinitialiser les statistiques
+        self.stats = {
+            "total_go": 0,
+            "total_nogo": 0,
+            "correct_go": 0,
+            "correct_nogo": 0,
+            "commission_errors": 0,
+            "omission_errors": 0,
+            "mean_rt": 0,
+            "total_rt": 0,
+            "rt_count": 0
+        }
+        
+        # Comptabiliser chaque type d'essai
+        for essai, chiffre, rt, trial_type, result in self.results:
+            if trial_type == "Go":
+                self.stats["total_go"] += 1
+                if result == "Réponse correcte":
+                    self.stats["correct_go"] += 1
+                    # Calculer le temps de réaction moyen (seulement pour les GO corrects)
+                    if rt != "":
+                        self.stats["total_rt"] += rt * 1000  # Conversion en ms
+                        self.stats["rt_count"] += 1
+                else:
+                    self.stats["omission_errors"] += 1
+            else:  # No-Go
+                self.stats["total_nogo"] += 1
+                if result == "Réponse correcte":
+                    self.stats["correct_nogo"] += 1
+                else:
+                    self.stats["commission_errors"] += 1
+        
+        # Calculer le temps de réaction moyen
+        if self.stats["rt_count"] > 0:
+            self.stats["mean_rt"] = self.stats["total_rt"] / self.stats["rt_count"]
+
+    def update_statistics_display(self):
+        """Met à jour l'affichage des statistiques"""
+        # Calcul des pourcentages
+        go_percent = (self.stats["correct_go"] / self.stats["total_go"] * 100) if self.stats["total_go"] > 0 else 0
+        nogo_percent = (self.stats["correct_nogo"] / self.stats["total_nogo"] * 100) if self.stats["total_nogo"] > 0 else 0
+        commission_percent = (self.stats["commission_errors"] / self.stats["total_nogo"] * 100) if self.stats["total_nogo"] > 0 else 0
+        omission_percent = (self.stats["omission_errors"] / self.stats["total_go"] * 100) if self.stats["total_go"] > 0 else 0
+        
+        # Mise à jour des labels
+        self.go_trials_label.config(text=f"Essais Go (tous sauf 3): {self.stats['total_go']}")
+        self.nogo_trials_label.config(text=f"Essais No-Go (chiffre 3): {self.stats['total_nogo']}")
+        
+        self.correct_go_label.config(text=f"Réponses correctes Go: {self.stats['correct_go']} ({go_percent:.1f}%)")
+        self.correct_nogo_label.config(text=f"Inhibitions correctes No-Go: {self.stats['correct_nogo']} ({nogo_percent:.1f}%)")
+        
+        self.commission_errors_label.config(text=f"Erreurs de commission: {self.stats['commission_errors']} ({commission_percent:.1f}%)")
+        self.omission_errors_label.config(text=f"Erreurs d'omission: {self.stats['omission_errors']} ({omission_percent:.1f}%)")
+        
+        self.rt_label.config(text=f"Temps de réaction moyen: {self.stats['mean_rt']:.1f} ms")
+
+    def export_csv(self):
+        """Exporte les résultats au format CSV"""
+        if not self.results:
+            messagebox.showwarning("Aucun résultat", "Aucun résultat à exporter.")
+            return
+
+        # Créer un nom de fichier par défaut
+        default_filename = f"SART_{self.participant_id}_{self.session_id}.csv"
+        
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".csv", 
+            filetypes=[("CSV files", "*.csv")],
+            initialfile=default_filename
+        )
+        
+        if file_path:
+            try:
+                with open(file_path, mode="w", newline="", encoding="utf-8") as file:
+                    writer = csv.writer(file)
+                    
+                    # En-tête avec métadonnées
+                    writer.writerow(["Test SART - Données brutes"])
+                    writer.writerow(["ID Participant", self.participant_id])
+                    writer.writerow(["Session", self.session_id])
+                    writer.writerow(["Date", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+                    writer.writerow([])
+                    
+                    # En-tête des résultats
+                    writer.writerow(["Essai", "Chiffre", "Temps de réaction (s)", "Type d'essai", "Résultat"])
+                    writer.writerows(self.results)
+                    
+                    # Ajouter les statistiques
+                    writer.writerow([])
+                    writer.writerow(["Statistiques"])
+                    writer.writerow(["Total essais Go", self.stats["total_go"]])
+                    writer.writerow(["Total essais No-Go", self.stats["total_nogo"]])
+                    writer.writerow(["Réponses correctes Go", self.stats["correct_go"]])
+                    writer.writerow(["Inhibitions correctes No-Go", self.stats["correct_nogo"]])
+                    writer.writerow(["Erreurs de commission", self.stats["commission_errors"]])
+                    writer.writerow(["Erreurs d'omission", self.stats["omission_errors"]])
+                    writer.writerow(["Temps de réaction moyen (ms)", f"{self.stats['mean_rt']:.1f}"])
+                    
+                messagebox.showinfo("Succès", f"Résultats exportés vers {file_path}")
+                
+                # Ouvrir le répertoire contenant le fichier
+                os.startfile(os.path.dirname(os.path.abspath(file_path)))
+            except Exception as e:
+                messagebox.showerror("Erreur d'exportation", f"Une erreur s'est produite lors de l'exportation: {str(e)}")
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = SARTApp(root)
+    root.mainloop()
